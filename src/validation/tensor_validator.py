@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Optional, Tuple, Dict, Union
 
 
 class TensorValidator(ABC):
@@ -17,22 +17,32 @@ class TensorValidator(ABC):
         self.next_validator = next_validator
 
     @abstractmethod
-    def validate(self, operand: Any, **kwargs) -> bool:
+    def validate(self,
+                 operand: Any,
+                 **kwargs
+                 ) -> Optional[Any]:
         """
-        Validates the given operand according to specific criteria.
+        Validates the given operand according to specific criteria. You
+        should return None if successful
 
         :param operand: The tensor to be validated.
         :param kwargs: Additional keyword arguments that may be needed for validation.
-        :return: True if the operand passes validation, False otherwise.
+        :return: Nothing if successful. If unsuccessful, return arguments you can
+                 use to build the message and the exception.
         """
         pass
 
     @abstractmethod
-    def make_message(self, operand: Any, context_string: str, **kwargs) -> str:
+    def make_message(self,
+                     operand: Any,
+                     arguments: Any,
+                     context_string: str,
+                     **kwargs) -> str:
         """
         Generates an error message for a validation failure.
 
         :param operand: The tensor that failed validation.
+        :param arguments: Any arguments stored during validate
         :param context_string: A context string providing additional information about the validation context.
         :param kwargs: Additional keyword arguments that may be relevant for generating the error message.
         :return: A string containing the error message.
@@ -40,11 +50,14 @@ class TensorValidator(ABC):
         pass
 
     @abstractmethod
-    def make_exception(self, message: str) -> Exception:
+    def make_exception(self,
+                       message: str,
+                       arguments: Any) -> Exception:
         """
         Creates an exception object from the given error message.
 
         :param message: The error message.
+        :param arguments: Any arguments returned by validate.
         :return: An Exception object containing the error message.
         """
         pass
@@ -58,8 +71,10 @@ class TensorValidator(ABC):
         :param kwargs: Additional keyword arguments for validation.
         :return: An Exception if validation fails, None otherwise.
         """
-        if not self.validate(operand, **kwargs):
-            message = self.make_message(operand, "Validation failed", **kwargs)
+
+        if self.validate(operand, **kwargs) is not True:
+            arguments = self.validate(operand, **kwargs)
+            message = self.make_message(operand, arguments,  "Validation failed", **kwargs)
             exception = self.make_exception(message)
             return exception
 
@@ -82,3 +97,23 @@ class TensorValidator(ABC):
                 current = current.next_validator
             current.next_validator = other
         return self
+
+class PassthroughValidator(TensorValidator):
+    """
+    Performs no validation, just transparently passes the chain through
+    """
+    def validate(self,
+                 operand: Any,
+                 **kwargs
+                 ) -> Union[bool, Any]:
+        return True
+    def make_message(self,
+                     operand: Any,
+                     arguments: Any,
+                     context_string: str,
+                     **kwargs) -> str:
+        raise RuntimeError("This should never happen")
+    def make_exception(self,
+                       message: str,
+                       arguments: Any) -> Exception:
+        raise RuntimeError("This should never happen")

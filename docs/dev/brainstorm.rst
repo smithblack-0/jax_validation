@@ -256,14 +256,11 @@ Under this operation, for each subnode in the tree we
 reuse the TensorValidator we saw earlier again and
 again, applying it to each subnode.
 
-A special constructor argument can shut this off
-
 **Specs**
 
 Schema is a dataclass. It contains two fields:
 
 - Schema: The PyTree representing the schema.
-- Broadcast: A bool, whether or not to schema broadcast. Default true.
 
 **Function: make_schema**
 
@@ -283,6 +280,7 @@ def make_schema(pytree,
     return the tree inside a Schema, with leaves replaced.
 
 
+
 PyTreeValidator
 ---------------
 
@@ -294,41 +292,47 @@ The PyTreeValidator can consume a schema at construction time, or recieve one
 as a kwargs during runtime. Once it gets the schema, it will walk it in parallel
 with the target operand tree and verify the schema and the tree match any TensorValidators
 
-Generally,
 
-**Specs: PairedWalker**:
+**Schema Tree Shape Validation**
 
-The PairedWalker class is responsible,
-pehaps unsurprisingly, for walking through
-two paired treedefs in order to perform
-validation actions.
+There are several things we need to worry about to make sure the schema's are
+the same.
 
-It accepts two jax treedef's, first from the schema and second from
-the operand, upon construction. It will also accept an is_leaf extension
-for jax.tree_util functions.
+Jax builtin utilities for handling trees includes a certain utility. This utility
+is flatten_with_path. It will return a list of tuples containing the detected path
+to a leaf, and then the leaf value itself, when you provide it with a pytree. By
+providing a small helper function, it will also return something when the input
+is None.
 
-The class can then be iterated, and when iterated will return two integers.
-These integers tell us what leaf, by dfs, of the spec maps onto what leaf, by dfs,
-of the operand. This works nicely with jax.tree_util.flatten, which will give the
-leaves in such an order.
+So long as we catch every leaf, including none, I think we can make it work.
 
-Pairwalker will also raise a PyTreeStructure exception if it detects the
-two pytrees are incompatible. This might happen if:
+*PyTree Structure Same*:
 
-* Like Schema and Operand branches are different types
-* Like Schema and Operand branches have different number of children
-* Like Schema and Operand nodes are in a condition where the operand is in a leaf
-  state, but the schema is not
+So long as the pytree structure is the same, this could prove it. We flatten both
+trees. Then we walk through their shape/path tuples in parallel. So long as the
+path keys are the same, which are in a conveniently hashable tuple, we accept the
+structure to be the same.
 
-Broadcasting behavior occurs when:
+While we are visiting the nodes, we can apply whatever other validation actions we
+need
 
-* Like schema and operand nodes have a leaf on the schema, and not on the operand.
+*PyTree Structures broadcastable*
 
-This will cause the return on the operand integer to increment while the schema
-one stays the same, until exiting the broadcasting region.
+In the case of a broadcast being required, it will eventually become
+the case that the schema node_paths no longer are compatible with the
+operand node_paths. Fortunately, this is also handlable. Two trees are
+compatible for tree broadcast if they have the same shape until one of them
+reaches a leaf
 
+We check if the path for the operand is longer than the path for the
+schema. If it is, it might be broadcastable. We then check if the path
+of the operand, concatenated to the length of the schema path, are the same
 
+If it is, we are in broadcast mode, and take appropriate action
 
+*Pytrees incompatible*
+
+Otherwise, the pytrees will be found to be incompatible.
 
 ** Specs **
 
@@ -337,114 +341,33 @@ fields:
 - Mode: One of "header" or "tail". Lets the class know whether to
         apply common before anything leaf-specific, or after
 - Schema: One of either a Schema, or a string specifying what the kwarg will be for it
+- Broadcast: A bool. Whether to allow broadcast, or throw errors
 
 methods
 
 constructor:
     - The constructor is used to setup mode and schema information
     - The constructor accepts two parameters. One, required, is schema. This
-      should either be a Schema or a string. The other, Mode, is optional. It
+      should either be a Schema or a string. The , Mode, is optional. It
       should be among "header" or "tail". Default will be header, for no particular
       reason.
+
     - Either way, we set the Schema and Mode
 
 merge_tensor_validators:
     - Accepts a tensor validator
-    - Merges it with Common, either as the head or tail depeding on mode
+    - Merges it with Common, either as the head or tail depending on mode. Uses self
 
 validate_leaf:
-    - Validates whether a leaf is compatible
+ - Validates whether a leaf is compatible
     - Accepts the leaf to validate, and the TensorValidator
+    - Merges the TensorValidator with the common TensorValidator
     - Executes the validation against the leaf
-    - return the result
-validate_broadcast_branch:
-    - Validates by continuing to descend whether
-      broadcast condition is being met
-    - Accepts a TreeDef, a TensorValidator, a list of operand Leafs, and a
-      kwargs collections
-    - Descends by depth-first through treedef. When it reaches a leaf,
-        it pops off that leaf, and applies the TensorValidator to it by
-        passing it the leaf and the kwargs.
-    - If the result was an exception, fetch the message out of the
-    - Use a try block to catch errors thrown each time. Raise a new exception with
-      tree location information from the current error.
+    - return the result, which is either None or an Exception
 
-validate_branch:
-    - Conceptually, perform validation actions in a depth-first decent
-      format when both the spec and operand are unraveling in symmetric mode
-    - Accept a tuple bundle of two jax PyTreeDefs,
-        - one representing the Spec
-        - one representing the operand being validated
-    - Accept a tuple of leaves:
-        - one a list from flattening the spec
-        - one a list from flattening the operand
-    - Accept broadcast_bool:
-    - Base Case: Function must first check if leaf condition has been reached
-      on spec. Use jax.tree_util.treedef_is_leaf.
-        - If it has, pop the next validator off of the
-          leaves tuple from the spec portion. Merge it with the
-
-        - If the leaf condition is also reached on operand,
-            - Run validate leaf and return result
-        - Elif broadcast:
-            - Run validate_broadcast and return result
-        - Else:
-            - Return error message indicating broadcast requested but
-              disabled
-    - Descent case:
-        - Get children off of spec, operand using jax.tree_util.get_children
-        - Return string complaining if number of children are different
-        - Iterate through children pairs, running validate_branch on each.
-            - If result is not None, call revise_message_with_location to attach more info, then
-              return message
-    - Try block a try block to catch errors thrown each time. Raise a new exception with
-      tree location information from the current error.
-
-
-
-one representing the
-      tree. Accept an optional TensorValidator. Also accept a kwargs collection,
-    - If the
 validate:
-    - This will be expected to actually perform the validation. It is not user
-      implemented
-    - It accepts a Operand, expected to be a PyTree, and a Schema. That schema's
-      location will be found upstream.
-
-    - It walks the tree, perhaps using a helper function, validating. This means:
-        - Walk the operand and schema in parallel. Keep track of what you
-          have walked through. Inform with
-
-
-Needed interation behavior
-
-```
-#Known schema and broadcast tensor validator
-validator = PyTreeValidator(schema)
-validator = validator | tensor_validator
-
-
-
-```
-# delayed schema, common tensor validatior
-validator = PyTreeValidator()
-validator = PyTreeValidator | tensor_validator
-```
-validator(target, schema=schema)
-
-
-```
-# known schema, delayed
-
-```
-
-*Interations*:
-- Specify schema dynamically, broadcast static tensor config across
-- Specify schema statically, broadcast dynamic tensor spec across
-- Specify
-
-Schema
-------
+- Validates whether a particular PyTree is compatible with a particular schema
+-
 
 The base schema specification
 
