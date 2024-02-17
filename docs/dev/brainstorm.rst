@@ -135,39 +135,38 @@ I conclude
 - Architecture should work around jit incompatibility
 - Architecture should allow passthrough of extra information
 
-Round 2: Core feature: TensorValidator
+Round 2: Core feature: Validator
 ======================
 
-Tensor Validation Class: TensorValidator
+Validation Class: Validator
 
 We define there to exist the following main
-restriction mechanism. It has specification as follows:
+validation mechanism. It has specification as follows:
 
 **General concept**
 
-- Operates on a tensor level
+- Abstract
 - Can accept and utilize kwargs and a target operand to target for validation. Will then
   perform validation
 - Is a "Chain of responsibility" mechanism, meaning a one way
   linked list is being built internally.
+- Validation override is an abstract method
 
 **Specification**
+- Contains constructor __new__:
+    - Sets up method 'clone' that can be provided with 'next_validator' and
+      will setup a node with the exact same parameters, but pointing to that
+      next validator instead
+    -
 - Contains constructor __init__:
-    - Constructor can be provided with another tensor validation class
+    - Constructor can be provided with another validation class
     - This will be stored to see to the chain of responsibility.
     - This is optional.
 - Contain function called *validate*:
-    - Indicates whether or not validation was passed
+    - It indicates whether validation succeeds or fails
+    - It is abstract - subclasses need to implement
     - Accepts operand, kwargs
-    - Returns bool.
-- Contains function called *make_message*:
-    - Generates error message of some sort
-    - Accepts operand, context_string, kwargs
-    - Returns string
-- Contains function called *make_exception*:
-    - Generates error from message
-    - Accepts str
-    - Returns Exception
+    - Returns either None, if validation passes, or an Exception, if fialed.
 - Contains function for __call__
     - Performs validation.
         - Validates self condition.
@@ -214,6 +213,81 @@ validator = validator & MatchBatchShape()
 
 The classes will then rebuild themselves to create a linked mechanism that first
 executes probability, then MatchBatchShape
+
+Round 3: Core Features: PyTreeValidator
+=======================================
+
+my tools from for validation of pytree are puny. In particular
+    - I have the ability to flatten a tree and get a list of path, leafs. This is implemented in c++, fast
+    - I have the ability to build my own walker that calls into jax's treedef. Slow
+    - I do NOT have the ability to walk trees in parallel using my own predicates or logic
+      under their framework.
+
+I would like to be able to specify the pytree shape fairly naturally
+    - Provide a pytree that the shape needs to match. Optionally, provide conditions
+    - Statically build
+    - Reveal shape at runtime.
+    - Broadcasting - one node on a schema's Validator applies to many children
+
+
+Two main types of issues can occur here. They are
+    - The Pytree's shape is malformed.
+    - The check for an individual leaf failed.
+
+I would like to have detailed error messages
+    - This includes information on where the nodes diverge.
+
+So:
+    - flatten both schema and operand trees
+    - walk through children, and compare
+    - Pass through validator checks, and provide useful error info on WHERE a pytree is malformed
+
+schema
+------
+
+A schema is an object that contains a pytree with children of None or Validator. Downstream objects
+will broadcast a schema if needed - this means that if the schema ends on a validator leaf, while the operand
+pytree ends on a branch, all decendent children of that branch will see the same validator leaf applied to them.
+
+- The pytree may be filled with any jax nodes, so long as they terminate with None or Validator
+- The schema has a method .attach_head, that takes every child node and inserts the head at the front, like:
+    new_node = head & node
+- The schema has a method .attach_tail. It takes every node and inserts tail near the end. Like:
+    new_node = node & tail
+
+error messages
+--------------
+
+Structural issue messages:
+
+- point out something is missing or different, and where it is
+for example:
+
+"Along branches: x/y/z
+
+The following difference occurred between original and novel branch
+
+                original,                  novel
+                KeyNode("hi"),           Keynode("hi")
+difference ->   KeyNode("potato")        Keynode("tomato")
+difference ->   KeyNode("tomato")        Keynode("potato")
+
+Getting this done means:
+
+- Notice when the keypaths become incompatible
+- Track down where the divergence happens
+- Mockup children at that level, extract info
+- Reveal this info in console.
+condition-by-condition
+----------------------
+
+No issue:
+    - The paths match. We apply the validator. It matches
+Broadcasting:
+    - The paths do not match. check if
+Lets say we are walking the above. What can happen?
+    - We compare the paths. They do not match.
+    - We check for
 
 Round 2: Core Features: Schema Class
 ====================================

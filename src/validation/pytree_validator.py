@@ -3,7 +3,7 @@ import textwrap
 from jax import tree_util
 from jax.tree_util import PyTreeDef, KeyPath, KeyEntry
 from typing import Tuple, Optional, Union, Any, List, Dict, Sequence
-from .tensor_validator import TensorValidator, PassthroughValidator
+from .tensor_validator import TensorValidator
 from dataclasses import dataclass
 @dataclass
 class Schema:

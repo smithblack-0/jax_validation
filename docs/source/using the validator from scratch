@@ -1,0 +1,224 @@
+Validators and immutable linked list logic
+==========================================
+
+Validators are immutable linked list nodes. Each node is designed to perform one validation
+task, then ask the next node for it's task as well. The immutability is a somewhat
+difficult property to maintain, but worth it as it significantly simplifies downstream
+logic. It also means that if you build up a validation chain, you can safely apply it in
+multiple places.
+
+Implementing a Validator
+========================
+Conceptually, there are several phases to setting up and using
+a validator. They might be catagorized into:
+
+    - definition: Subclass Validator, then define 'validator' and 'handle'
+    - setup: Create particular instances of the validator, and fill in any init details
+    - linkage: Link validators together into a chain using composition to achieve a particular task
+    - usage: Call the validator
+
+
+Defining a simple validator
+===========================
+
+The definition phase involves defining what we actually want the
+validator to do.
+
+To do this, we must define abstract method
+'validate', and return either none, when validation passes,
+or an exception, if it fails.
+
+We may also setup the 'handle' function to let us know what
+to do when another validator downstream finds an error. Passing
+an error back will ensure it continues to be passed upstream,
+while not passing back will stop the error chain on that node.
+
+Note that regardless on whether you plan to use them or not,
+you still need to specify kwargs.
+
+Simple example
+--------------
+
+```
+class PositiveValidator(Validator):
+    # This simple class works without an init function
+    def validate(self, operand, **kwargs):
+        if jnp.all(operand > 0):
+            return None
+        return Exception("Operand must be positive")
+```
+
+Defining a validator using init
+---------------------------------
+
+Setting up an __init__ call is optional, and may not be needed
+for simple validators. However, some validators, that should be setup once
+and used many times, may benefit from using an init. Lets see an example
+
+```
+class IsDtype(Validator):
+    #This sets up a threshold on the fly
+    def __init__(self, dtype: jnp.dtype):
+        self.dtype = dtype
+    def validate(self, operand, **kwargs):
+        if operand.dtype != self.dtype
+            raise TypeError("Wrong Dtype")
+```
+Defining a validator using runtime mutables
+---------------------------------------------
+
+Sometimes, you may have features for which you do
+not details of until you actually run the program.
+Batch shape might be a good example.
+
+Such cases are also covered. You can configure your validate
+function to retrieve something out of kwargs, or accept a kwarg from
+upstream. Note that *args are not allowed.
+
+For example:
+
+```
+class EnsureBatchShape(Validator):
+    def validate(self,
+                operand: jnp.ndarray,
+                batch_shape: int,
+                **kwargs)->Optional[Exception]:
+        if operand.shape[0] != batch_shape
+
+Defining how errors are dealt with using handle
+-----------------------------------------------
+
+Sometimes, you might want to do something
+with the error that has been detected, such as
+throw it or log it. This is what the function
+"handle" is for.
+
+Passing an error back out of handle will ensure it continues to be passed upstream,
+while not passing back will stop the error chain on that node. Lets see a few examples
+of how this could be used.
+
+```
+from ...somewhere import config
+
+class SuppressErrors(Validator):
+    # Conditionally suppresses errors from further down the chain
+    # if the suppress_errors kwarg bool was true
+    def validate(self, operand, **kwargs)->Optional[Exception]:
+        # Passthrough on the forward pass
+        return None
+    def handle(self,
+              exception: Exception,
+              suppress_errors: bool,
+              **kwargs):
+        if suppress_errors:
+            return None
+        else:
+            return exception
+```
+
+```
+class Log(Validator):
+    # Log the event at this location by
+    # using a callback
+    def __init__(self, your_custom_logging_framework):
+        self.logger = your_custom_logging_framework
+    def validate(self, operand, **kwargs)->Optional[Exception]:
+        # Passthrough on the forward pass
+        return None
+    def handle(self, exception: Exception)->Exception:
+        self.logger.log(exception)
+        return exception
+```
+
+```
+class Throw(Validator):
+    # Just throw when I see an error
+
+    def validate(self, operand, **kwargs)->Optional[Exception]:
+        # Passthrough on the forward pass
+        return None
+    def handle(self, exception: Exception):
+        throw exception
+```
+
+-----------------
+
+Lets consider the three validators defined above, and one more validator
+called throw. We will now examine how to use setup and linkage to construct
+a validation chain.
+
+First, for convenience, define throw:
+
+
+- Statically define validator: Pass in the init arguments for this validator. These should never
+  be things you will rely on side effects for
+- Apply validation with runtime kwargs:
+
+
+
+validators divide validation into static initialization parameters,
+runtime-mutable kwargs, and an operand that will be operated on. The user needs to
+define the function 'validate' which will accept an operand and user kwargs, and return
+either None or an error.
+
+
+
+Validators also have certain rules placed upon the parameters allowed in __init__. In particular,
+it is the case that the actual details of the parameters themselves, the leaves of the pytrees, must
+be hashable. In general, you should NEVER rely on side effects defined through the constructor. Only
+use features with side effects, like logging or dictionaries, through passed kwarg features. Also,
+note that if you pass a custom class through the __init__ constructor, you may have difficulty
+unless you register it in tree_util:
+
+Example:
+
+
+    class BetweenThresholds:
+        # This also works, despite list being mutable.
+        #
+        # Not that you would ever ACTUALLY design
+        # a validator this way.
+        def __init__(self, thresholds: List[int]):
+            lower, upper = thresholds
+            self.lower = lower
+            self.upper = upper
+        def validate(self, operand, **kwargs):
+            if operand < self.lower or operand > self.uppper:
+                raise ValueError("outside of threshold")
+
+    class LoggingSideEffects:
+        # This will NOT work at all.
+
+
+
+
+
+
+
+
+Validators are designed to be composable, allowing multiple validators to be combined
+using logical operations. This composability enables the construction of complex validation
+logic by chaining simpler validators.
+
+Example usage:
+    class PositiveValidator(Validator):
+        def validate(self, operand, **kwargs):
+            if operand > 0:
+                return None
+            return Exception("Operand must be positive")
+
+    class EvenValidator(Validator):
+        def validate(self, operand, **kwargs):
+            if operand % 2 == 0:
+                return None
+            return Exception("Operand must be even")
+
+    # Compose validators to check if an operand is both positive and even
+    validator = PositiveValidator() & EvenValidator()
+
+    # Use the composed validator
+    error = validator(5)  # This will pass the PositiveValidator but fail the EvenValidator
+    if error:
+        print(error)
+
+Subclasses must implement the `validate` method to define specific validation rules.
