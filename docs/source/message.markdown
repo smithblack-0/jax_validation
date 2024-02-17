@@ -135,10 +135,19 @@ so I will be importing a lot of the work from there. Since they are unit tested,
 I think it should be fine. It also should be fairly fast, hopefully, as I
 will be leaning on the optimized jax code.
 
-## A quick example
+## Can I have?
 
-Lets just see a quick example of the power of the 
-architecture. Lets imagine a simple pet specification. It says
+At the moment, the library is not shared on mypy, but the repository is located at
+the following link if you want to poke around. Please note it is fairly unpolished 
+at the moment:
+
+
+
+
+
+## An example?
+
+Lets consider the following spec
 
 ```markdown
 
@@ -152,23 +161,21 @@ Probabilities Tensor Validation
 - You shall check that the batch shape is sane
 - You shall check that the type is floating
 - You shall check that the values are between 0 and 1
+- You shall provide me with a function that can test this
 
 Counter Tensor Validation:
 - You shall check that the dtype is int32
 - You shall check that the values are greater than or equal to zero
+- You shall provide me with a function to test this
 
 ... etc, but that is enough for now.
 ```
-j
 
-That should be enough for now. Lets see how the current
-library would implement that. This code is entirely
-functional at the moment, and it is presumed you would call the 
-appropriate functions when you need to get a validator
-for something.
-
-Note, however, the library is not in any shape to share 
-by mypy at the moment, 
+ Lets see how the current library would implement that. This code is entirely
+functional at the moment, and since the operators library is not in place
+yet we have to define each validation operation ourself. That is not a bad thing,
+though, as it shows the three main methods that can be overridden to influence
+behavior
 
 ```python
 
@@ -282,12 +289,12 @@ class ThrowOnError(PassthroughValidator):
     def handle(self, exception: Exception, **kwargs) ->Optional[Exception]:
         raise exception
 
-##
-# Now lets see this all in action
+## YOUR CODE STARTS HERE
 #
-# Start by mocking up bespoke integration. We would normally
-# be loading the configuration options from a config somewhere,
-# but we will let them be parameters for now
+# In practice, the above will likely be hidden away in a library
+# somewhere, and you will be dealing with logic more like the below
+#
+# Though, if you ever need to extend the library, you certainly can
 
 file_name = "errors.txt"
 suppress_errors = False
