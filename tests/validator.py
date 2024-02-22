@@ -114,6 +114,7 @@ class TestJitPytreeMechanisms(unittest.TestCase):
         validator = self.MockValidatorWithInit("raise")
         validator = self.MockCallbackWithInit(error_callback, _next_validator = validator)
         print(jax.make_jaxpr(validator)(1))
+        print(errors)
         validator(3)
         self.assertTrue(len(errors) == 1)
 

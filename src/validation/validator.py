@@ -595,11 +595,11 @@ class Validator(ABC):
         :return: A bool
         """
 
-    def _execute_predicate(self, **kwargs) -> bool:
+    def _execute_predicate(self, operand, **kwargs) -> bool:
         # A helper function that sanity checks
         # the users predicate
         try:
-            outcome = self.predicate(**kwargs)
+            outcome = self.predicate(operand, **kwargs)
         except Exception as err:
             raise SubclassDidNotRunException(self, validation_feature='predicate') from err
         if not isinstance(outcome, bool):
@@ -667,122 +667,136 @@ class Validator(ABC):
         return exception
 
     ##################
-    # Define logic used to operate the class
+    # Define logic used to actually perform valdiation
+    #
+    # The validation process is performed by passing
+    # operand and kwargs from parent to children node,
+    # and building an exception callback as we go. Shoudl
+    # exception status be reached, the callback is called into
+    # to handle the error.
+    #
+    # jax.lax.cond is usually used to handle branching to allow
+    # for jit compatibility.
+    #
     ###############
 
-    def _wrap_exception_callback(self,
-                                 exception_callback: Callable,
-                                 **kwargs
-                                 ):
+    ExceptionCallbackAlias = Callable
+
+    ######################
+    # Define validation pass and fail behavior
+    #
+    # Whether validation passes or fails, we will end up returning
+    # the operand. This will hopefully ensure jit does not optimize it
+    # away.
+    #
+    # However, on the failure branch, we execute a callback too
+    # which is suppose to handle the error condition
+    ##########
+
+    @staticmethod
+    def _base_case_passed(
+            callback: ExceptionCallbackAlias,
+            operand: Any,
+            **kwargs: Any
+            )->Any:
+        return operand
+
+    def _execute_exception_callback(self,
+                                    callback: ExceptionCallbackAlias,
+                                    operand: Any,
+                                    **kwargs: Any
+                                    )->Any:
+        exception = self._execute_create_exception(operand, **kwargs)
+        callback(exception, **kwargs)
+
+    @staticmethod
+    def _base_case_failed(
+            callback: ExceptionCallbackAlias,
+            operand: Any,
+            **kwargs: Any
+    )->Any:
+      jax.debug.callback(callback, operand, **kwargs)
+      return operand
+
+    ########
+    #
+    # Several branch statements must be handled. This requires functional
+    # usage of jax.lax.cond, and in places if statements. We need to handle
+    # branches for:
+    #
+    # 1) Did validation pass? (cond statement)
+    # 2) Did the chain predicate say continue? (cond statement)
+    # 3) Is there a next_validator to check?
+    #
+    #####
+
+    def _passed_branch(self,
+                      callback: ExceptionCallbackAlias,
+                      operand: Any,
+                      **kwargs: Any
+                      ) -> Any:
         """
-        Wraps the exception callback passed in a closure that
-        will first execute my handling function, then pass the
-        result back upstream
+        In the case where self validation passed, we need
+        to decide whether to validate further entries in the
+        chain, if they exist. We also need to eventually reach
+        a base case
 
-        :param exception_callback: The current execution callback
-        :param kwargs: Any kwargs of note
-        :return: The new execution callback, with my callback inserted
+        :param callback: The growing callback
+        :param operand: The operand to validate
+        :param kwargs: The kwargs conditioning the validation
+        :return:
         """
-        my_callback = jax.tree_util.Partial(self._execute_handle, self, **kwargs)
-        def closure(effects_token, exception: Exception):
-            jax.debug.callback(my_callback, exception)
-            jax.debug.print(str(exception) + str(effects_token))
-            return exception_callback(effects_token, exception)
-        return closure
+        # We have reached the passed base case if
+        #
+        # 1): There is no next entry.
+        # 2): There is a next entry, but the chain predicate says not to check it
+        #
+        # Otherwise, we will call into the next validator in the chain,
+        # which we now know exists
 
-
-    def _run_validation(self,
-                        operand: Any,
-                        exception_callback: Any,
-                        **kwargs
-                        ):
-        def continue_met_branch():
-            return self.next_validator._run_validation(effects_token, operand, exception_callback, **kwargs)
-
-        def continue_branch():
-            # Continue validating if there are further elements in the chain
-            if self.has_next:
-                continue_predicate = self._execute_chain_predicate(**kwargs)
-                jax.lax.cond(continue_predicate,
-                             continue_met_branch,
-                             lambda : None
-                             )
-
-        def exception_branch():
-            # Call into the exception callback if an exception state has been reached
-            exception = self._execute_create_exception(operand, **kwargs)
-            return exception_callback(effects_token, exception)
-
-        exception_callback = self._wrap_exception_callback(exception_callback)
-        predicate = self.predicate(operand, **kwargs)
-        return jax.lax.cond(predicate,
-                     continue_branch,
-                     exception_branch
-                     )
-
-    def _check_children(self, operand, **kwargs):
-        """
-        Checks child nodes if possible, and if not
-        returns the base case of zero
-        """
-        if self.has_next:
-            return self.next_validator._check_error_code(operand, **kwargs)
-        return 0
-
-    def _handle_chain_predicate(self, operand, **kwargs):
-        """
-        If here, the validation should have passed. Either
-        return 0 if chain predicate is false, indicating
-        base case, or go into check_childrein if true
-        """
-        return jax.lax.cond(self.chain_predicate(**kwargs),
-                            self._check_children,
-                            lambda operand, **kwargs : 0,
+        if not self.has_next:
+            return self._base_case_passed(callback, operand, **kwargs)
+        chain_predicate = self._execute_chain_predicate(**kwargs)
+        return jax.lax.cond(chain_predicate,
+                            self.next_validator._validate,
+                            self._base_case_passed,
+                            callback,
                             operand,
                             **kwargs
                             )
 
-    def _check_error_code(self, operand, **kwargs)->int:
+    def _validate(self,
+                 callback: ExceptionCallbackAlias,
+                 operand: Any,
+                 **kwargs)->Any:
+        """
+        This class performs one portion of validation.
 
-        validation_passed = self.predicate(operand, **kwargs)
-        error_code = jax.lax.cond(~validation_passed,
-                            lambda operand, **kwargs: 1, #Base case: Failed
-                            self._handle_chain_predicate, # Continue: Succeess
-                            operand,
-                            **kwargs
-                            )
+        This includes updating the callback stack if it exists,
 
-        # Increment by one each time you go up a node. If the validation failed, it means
-        # we are just passing back the error so we do not increment.
-        error_code = jax.lax.select(validation_passed & (error_code > 0), error_code + 1, error_code)
-        return error_code
+        :param callback:
+        :param operand:
+        :param kwargs:
+        :return:
+        """
+        @jax.tree_util.Partial
+        def exception_callback_wrapper(exception: Exception, **kwargs: Any):
+            # Ensures the node's handle function is called, then
+            # pass the result further up the chain.
+            exception = self._execute_handle(exception, **kwargs)
+            callback(exception, **kwargs)
 
-
-        def continue_cond(state: Tuple[int, int, bool]):
-            _, _, should_we_continue = state
-            return should_we_continue
-
-        def update_function(state: Tuple[int, int, bool]):
-            node_index, error_code, _ = state
-
-            predicate = self.fetch(node_index)(operand, **kwargs)
-            chain_predicate = self.fetch(node_index)(operand, **kwargs)
-            has_next = self.fetch(node_index).has_next
-
-            error_code = jax.lax.select(predicate, error_code, node_index)
-            should_continue = predicate & chain_predicate & has_next
-
-            return node_index + 1, error_code, should_continue
-
-        _, error_code,  = jax.lax.while_loop(continue_cond,
-                                              update_function,
-                                              (0, -1, True)
-                                              )
-        return error_code + 1
+        did_validation_pass = self._execute_predicate(operand, **kwargs)
+        output = jax.lax.cond(did_validation_pass,
+                              self._passed_branch,
+                              self._base_case_failed,
+                              exception_callback_wrapper,
+                              operand,
+                              **kwargs)
+        return output
 
 
-
-    def __call__(self, operand: Any, **kwargs) -> Optional[Exception]:
+    def __call__(self, operand: Any, **kwargs) -> Any:
         """
         Executes the validation check on the given operand. If validation fails at any
         point in the chain, an exception is returned. Otherwise, None is returned,
@@ -796,8 +810,8 @@ class Validator(ABC):
                        not know it when creating a validator.
         :return: An Exception if validation fails at any point in the chain, None otherwise.
         """
-        error_code = self._check_error_code(operand, **kwargs)
-        print(error_code)
-        self._run_validation(operand, error_stack, lambda exception: None, **kwargs)
-        print(error_stack)
-        return error_stack
+
+        return self._validate(lambda exception, **k : None,
+                       operand,
+                       **kwargs
+                       )
