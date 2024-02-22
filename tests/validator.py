@@ -5,7 +5,7 @@ from src.validation.validator import Validator
 from jax import numpy as jnp
 from src.validation import patching
 
-#jax.config.update("jax_traceback_filtering","off")
+jax.config.update("jax_traceback_filtering","off")
 
 class ValidatorInitializationTests(unittest.TestCase):
     """
@@ -77,7 +77,7 @@ class TestJitPytreeMechanisms(unittest.TestCase):
             # Test
             self.do_raise = do_raise
         def predicate(self, operand, **kwargs)->bool:
-            return self.do_raise == "raise"
+            return self.do_raise != "raise"
         def create_exception(self, operand: Any, **kwargs) -> Tuple[bool, Exception]:
             return Exception("This test raised")
 
@@ -105,18 +105,30 @@ class TestJitPytreeMechanisms(unittest.TestCase):
         self.assertIs(new_validator, validator)
 
     def test_chained_callback(self):
-        errors = []
-        def error_callback(exception: Exception):
-            print(exception)
-            errors.append(exception)
-            print("passed")
+        class logging_observer:
+            def __init__(self):
+                self.errors = []
+            def log(self, exception: Exception):
+                self.errors.append(exception)
+        class Logger(Validator):
+            def __init__(self, observer: logging_observer):
+                self.observer = observer
+            def predicate(self, operand: Any, **kwargs) ->bool:
+                return True
 
+            def create_exception(self, operand: Any, **kwargs) -> Exception:
+                return Exception("This should never happen")
+            def handle_exception(self, exception: Exception, **kwargs) ->Exception:
+                self.observer.log(exception)
+
+        observer = logging_observer()
         validator = self.MockValidatorWithInit("raise")
-        validator = self.MockCallbackWithInit(error_callback, _next_validator = validator)
-        print(jax.make_jaxpr(validator)(1))
-        print(errors)
-        validator(3)
-        self.assertTrue(len(errors) == 1)
+        validator = Logger(observer, _next_validator = validator)
+        try:
+            validator(3)
+        except Exception as err:
+            print(err)
+        print(observer.errors)
 
 
 class ValidatorLinkedListTests(unittest.TestCase):

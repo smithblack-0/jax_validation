@@ -699,23 +699,30 @@ class Validator(ABC):
             operand: Any,
             **kwargs: Any
             )->Any:
+        jax.debug.print("passed: {operand}", operand=operand)
+
         return operand
 
     def _execute_exception_callback(self,
-                                    callback: ExceptionCallbackAlias,
+                                    exception_callback: ExceptionCallbackAlias,
                                     operand: Any,
                                     **kwargs: Any
                                     )->Any:
+        jax.debug.print("failed: {operand}", operand=operand)
         exception = self._execute_create_exception(operand, **kwargs)
-        callback(exception, **kwargs)
+        exception_callback(exception, **kwargs)
 
-    @staticmethod
-    def _base_case_failed(
-            callback: ExceptionCallbackAlias,
-            operand: Any,
-            **kwargs: Any
+    def _base_case_failed(self,
+                        callback: ExceptionCallbackAlias,
+                        operand: Any,
+                        **kwargs: Any
     )->Any:
-      jax.debug.callback(callback, operand, **kwargs)
+      jax.debug.print("failed: {operand}", operand= operand)
+      jax.experimental.io_callback(self._execute_exception_callback,
+                                   None,
+                                     exception_callback =callback,
+                                     operand = operand,
+                                     **kwargs)
       return operand
 
     ########
@@ -756,6 +763,7 @@ class Validator(ABC):
 
         if not self.has_next:
             return self._base_case_passed(callback, operand, **kwargs)
+        return self.next_validator._validate(callback, operand, **kwargs)
         chain_predicate = self._execute_chain_predicate(**kwargs)
         return jax.lax.cond(chain_predicate,
                             self.next_validator._validate,
@@ -779,10 +787,12 @@ class Validator(ABC):
         :param kwargs:
         :return:
         """
+
         @jax.tree_util.Partial
         def exception_callback_wrapper(exception: Exception, **kwargs: Any):
             # Ensures the node's handle function is called, then
             # pass the result further up the chain.
+
             exception = self._execute_handle(exception, **kwargs)
             callback(exception, **kwargs)
 
@@ -810,7 +820,6 @@ class Validator(ABC):
                        not know it when creating a validator.
         :return: An Exception if validation fails at any point in the chain, None otherwise.
         """
-
         return self._validate(lambda exception, **k : None,
                        operand,
                        **kwargs
