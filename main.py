@@ -1,6 +1,6 @@
-
+import jax
 from jax import numpy as jnp
-from src.validation.core import Validator
+from src.validation.validator import Validator
 from typing import Optional, Any
 from datetime import datetime
 
@@ -18,23 +18,22 @@ class Probability(Validator):
     def validate(self,
                  operand: jnp.ndarray,
                  **kwargs)->Optional[Exception]:
-        if jnp.any(operand > 1.0):
-            return ValueError("Probability in tensor exceed 1 on some elements")
-        elif jnp.any(operand < 0.0):
-            return ValueError("Probability in tensor is less than 0 on some elements")
-        return None
+        predicate = jnp.any(operand > 1.0) | jnp.any(operand < 0.0)
+        exception = ValueError("Probability must be between 1 and 0")
+        return predicate, exception
 class Floating(Validator):
     """
     Validates that the incoming operand is of
     """
     def validate(self, operand: jnp.ndarray, **kwargs) -> Optional[Exception]:
-        if not jnp.issubdtype(operand.dtype, jnp.floating):
-            return TypeError("Tensor was found to not be floating")
+        predicate = jnp.issubdtype(operand.dtype, jnp.floating)
+        exception = TypeError("Tensor was found to not be floating")
+        return predicate, exception
 
 class ZeroOrGreater(Validator):
     def validate(self, operand: jnp.ndarray, **kwargs) -> Optional[Exception]:
-        if jnp.any(operand < 0):
-            return ValueError("Tensor was found to have values less than zero")
+        return jnp.any(operand <0), ValueError("Tensor was found to have values less than zero")
+
 class Dtype(Validator):
     """
     Validates the incoming operand is a particular dtype
@@ -51,10 +50,10 @@ class BatchShape(Validator):
     'batch_shape' = int must be provided as a kwarg
     """
     def validate(self, operand: jnp.ndarray, batch_shape: int, **kwargs) -> Optional[Exception]:
-        if operand.shape[0] != batch_shape:
-            return TypeError(f"Expected batch of shape '{batch_shape}', but got {operand.shape[0]}")
+        predicate = operand.shape[0] != batch_shape
+        exception = TypeError(f"Expected batch of shape '{batch_shape}', but got {operand.shape[0]}")
+        return predicate, exception
 
-##
 # Define meta operators.
 #
 # These will modify how the error is raise, or even
@@ -68,7 +67,7 @@ class PassthroughValidator(Validator):
     the relevant bits
     """
     def validate(self, operand: Any, **kwargs) -> Optional[Exception]:
-        return None
+        return True, Exception()
 
 class SuppressErrorsWhenFlagged(PassthroughValidator):
     """
@@ -77,7 +76,7 @@ class SuppressErrorsWhenFlagged(PassthroughValidator):
     """
     def __init__(self, suppress_errors: bool):
         self.suppress_errors = suppress_errors
-    def chain_predicate(self, suppress_errors: bool, **kwargs):
+    def chain_predicate(self, **kwargs):
         return not self.suppress_errors
 
 class WriteErrorToFile(PassthroughValidator):
@@ -145,6 +144,9 @@ def cap_validator_chain(validator: Validator)->Validator:
     return make_bespoke_terminal() & validator
 def make_probability_validator()->Validator:
     probability_validator = Floating() & BatchShape() & Probability()
+    print(jax.make_jaxpr(probability_validator))
+    probability_validator = jax.jit(probability_validator)
+
     probability_validator = cap_validator_chain(probability_validator)
     return probability_validator
 

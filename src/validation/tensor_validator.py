@@ -1,4 +1,4 @@
-from core import Validator
+from patching import Validator
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Tuple, Dict, Union
 

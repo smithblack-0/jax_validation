@@ -2,7 +2,7 @@ import jax
 import textwrap
 from jax import tree_util
 from typing import Tuple, Optional, Union, Any, List, Dict, Sequence
-from .core import Validator
+from .patching import Validator
 
 
 
