@@ -1,15 +1,19 @@
 import unittest
 import jax
 from typing import Any, Optional, Tuple, Callable
-from src.validation.validator import Validator
+from src.validation.core import ValidatorException, Validator
 from jax import numpy as jnp
 from src.validation import patching
 
 jax.config.update("jax_traceback_filtering","off")
 
+SHOW_ERROR_MESSAGES = True
+
 class ValidatorInitializationTests(unittest.TestCase):
     """
-    Test various validator mechanisms.
+    Test validator initialization mechanisms, including that
+    initialization is possible and that linked list mechanism are
+    executing correctly.
 
     The constructor is extremely complex for this class,
     relying on interactions between __new__, __init_subclass__,
@@ -37,13 +41,6 @@ class ValidatorInitializationTests(unittest.TestCase):
         def handle_exception(self, exception: Exception, **kwargs) ->Exception:
             print(exception)
             return Exception()
-
-    class MockValidatorWithKwargs(Validator):
-        def predicate(self, operand, do_raise: bool, **kwargs)->bool:
-            return jnp.logical_not(do_raise)
-        def create_exception(self, operand: Any, do_raise: bool, **kwargs) -> Optional[Exception]:
-            return Exception("Raise requested")
-
     def test_constructor_basic_init(self):
         # Test we can initialize when just overwriting validate
         self.MockValidator()
@@ -62,6 +59,164 @@ class ValidatorInitializationTests(unittest.TestCase):
         first_validator = self.MockValidator()
         second_validator = self.MockValidator(_next_validator=first_validator)
         self.assertIs(second_validator.next_validator, first_validator)
+
+
+class TestHashFunction(unittest.TestCase):
+    """
+    Test cases for the initialization hash function are located here.
+
+    The hash function's purpose is to detect when a new object being
+    requested is equivalent to an existing one, and reuse the existing code
+    when setting up.
+
+    To do this, we need to understand when they will be equivalent. From the
+    perspective of the hash function, it needs to accomodate:
+
+    1) The class being instanced
+    2) The arguments to the class constructor
+    3) The chain of nodes that are being linked to the node being created
+
+    In practice this is going to mean:
+
+    1) The hash needs to depend on the qualified name of the class being instanced
+    2) The hash needs to depend on the flattened arguments being fed to the constructor
+    3) The hash needs to depend
+
+    """
+    def test_hash_nonrandom(self):
+        """Test the same arguments gets the same results"""
+
+        class subclass(Validator):
+            def predicate(self, operand: Any, **kwargs) ->bool:
+                return True
+            def create_exception(self, operand: Any, **kwargs) -> Exception:
+                return Exception()
+
+        leaves, treedef = jax.tree_util.tree_flatten(((),{}))
+
+        # Test that hashes are different
+
+        hash_one = subclass._create_hash(treedef, leaves, None)
+        hash_two = subclass._create_hash(treedef, leaves, None)
+        self.assertEqual(hash_one, hash_two)
+    def test_hash_distinguishes_subclasses(self):
+        """ Test that the hash function can produce a result that is dependent on the subclass"""
+
+        # Create two different example subclasses to test with.
+        #
+        # They will be different classes, but otherwise have the same behavior
+        class subclass_one(Validator):
+            def predicate(self, operand: Any, **kwargs) ->bool:
+                return True
+            def create_exception(self, operand: Any, **kwargs) -> Exception:
+                return Exception()
+
+        class subclass_two(Validator):
+            def predicate(self, operand: Any, **kwargs) ->bool:
+                return True
+            def create_exception(self, operand: Any, **kwargs) -> Exception:
+                return Exception()
+
+        # Create example constructor arguments
+
+        leaves, treedef = jax.tree_util.tree_flatten(((),{}))
+
+        # Test that hashes are different
+
+        hash_one = subclass_one._create_hash(treedef, leaves, None)
+        hash_two = subclass_two._create_hash(treedef, leaves, None)
+        self.assertNotEqual(hash_one, hash_two)
+    def test_hash_differentiates_arguments_differing(self):
+        """
+        Test that the hash function will properly detect and respond when the arguments for the
+        constructor are different.
+
+        In such a case, the hash should be different as well.
+        """
+        class subclass_with_init(Validator):
+            """ A simple mock example that just stores item."""
+            def predicate(self, operand: Any, **kwargs) ->bool:
+                return True
+            def create_exception(self, operand: Any, **kwargs) -> Exception:
+                return Exception()
+            def __init__(self, item: int):
+                self.item = item
+
+        # Test that the hash differs when the hash of the leaves
+        # differs
+
+        constructor_arguments_one, constructor_treedef = jax.tree_util.tree_flatten(((3), {}))
+        constructor_arguments_two, _ = jax.tree_util.tree_flatten(((4), {}))
+
+        hash_one = subclass_with_init._create_hash(constructor_treedef, constructor_arguments_one, None)
+        hash_two = subclass_with_init._create_hash(constructor_treedef, constructor_arguments_two, None)
+        self.assertNotEqual(hash_one, hash_two, "Hashes were equal, cannot tell between differing argumnts")
+    def test_hash_differentiates_linked_chain(self):
+        """
+        Test that the hash function can tell when different
+        children are put into place
+        """
+        # Create a subclass
+        class subclass(Validator):
+            def predicate(self, operand: Any, **kwargs) ->bool:
+                return True
+            def create_exception(self, operand: Any, **kwargs) -> Exception:
+                return Exception()
+
+        # Test with no child nodes, and with a singular one
+        instance = subclass()
+
+        leaves, treedef = jax.tree_util.tree_flatten(((),{}))
+        hash_one = subclass._create_hash(treedef, leaves, None)
+        hash_two = subclass._create_hash(treedef, leaves, instance)
+        self.assertNotEqual(hash_one, hash_two)
+    def test_hash_leaf_error(self):
+        """
+        Test that a sane and informative error is provided to the
+        user in the event one of the leaves cannot be hashed
+        """
+        class subclass(Validator):
+            def predicate(self, operand: Any, **kwargs) ->bool:
+                return True
+            def create_exception(self, operand: Any, **kwargs) -> Exception:
+                return Exception()
+
+        # Manually select the unhashable type of list
+        class unhashable:
+           __hash__ = None
+
+        unhashable_issue = {"test": unhashable()}
+        leaves, tree_def = jax.tree_util.tree_flatten(unhashable_issue, lambda x : isinstance(x, list))
+
+        # See what happens when we attempt to hash it
+        with self.assertRaises(ValidatorException) as err:
+            subclass._create_hash(tree_def, leaves, None)
+        if SHOW_ERROR_MESSAGES:
+            print("Test for if leaf is unhashable provides a sane error")
+            print(err.exception)
+            print(err.exception.__cause__)
+
+class TestLinkedList(unittest.TestCase):
+    """
+    Test the mechanisms of the linked lists
+
+    This includes automated merging, and the various helper functions.
+    """
+    def test_link_by_and(self):
+        raise NotImplementedError()
+    def test_append(self):
+        raise NotImplementedError()
+    def test_insert(self):
+        raise NotImplementedError()
+    def test_fetch(self):
+        raise NotImplementedError()
+    def test_slice(self):
+        raise NotImplementedError()
+    def test_walk(self):
+        raise NotImplementedError()
+    def test_str_representation(self):
+        raise NotImplementedError()
+
 
 class TestJitPytreeMechanisms(unittest.TestCase):
     class MockValidator(Validator):

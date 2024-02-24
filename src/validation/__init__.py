@@ -1,2 +1,2 @@
 from .patching import register_exception
-from .validator import Validator, ValidatorException, ValidatorNodeSpec
+from .core import Validator, ValidatorException, ValidatorNodeSpec

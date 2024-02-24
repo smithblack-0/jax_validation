@@ -36,7 +36,7 @@ def register_exception(exception: Exception):
     already_registered.add(exception)
 
 # Patch all default errors to be jittable
-for name in dir(builtins):
-    item = getattr(builtins, name)
-    if isinstance(item, type) and issubclass(item, BaseException):
-        register_exception(item)
+#for name in dir(builtins):
+#    item = getattr(builtins, name)
+#    if isinstance(item, type) and issubclass(item, BaseException):
+#        register_exception(item)

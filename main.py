@@ -1,6 +1,6 @@
 import jax
 from jax import numpy as jnp
-from src.validation.validator import Validator
+from src.validation.core import Validator
 from typing import Optional, Any
 from datetime import datetime
 
