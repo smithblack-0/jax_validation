@@ -2,15 +2,14 @@ import textwrap
 
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-from typing import Any, Optional, List, Dict, Tuple, Callable, Type, Union
+from typing import Any, Optional, List, Dict, Tuple, Callable, Type, Hashable
+
+from .state import get_success_callback, get_exception_callback, get_cache
+from .types import Operand
 
 import jax.tree_util
 from jax import tree_util
 from jax.tree_util import PyTreeDef
-from jax import numpy as jnp
-
-_validator_cache: Dict[int, 'Validator'] = {}
-
 
 ####
 # Define validation error, and validation functions.
@@ -18,6 +17,7 @@ _validator_cache: Dict[int, 'Validator'] = {}
 # Generally, these errors are used only if the user
 # set something up wrong.
 ########
+
 
 
 
@@ -45,36 +45,33 @@ class ValidatorException(Exception):
 
 
 def format_exception_message(
-        subclass: Union[Type['Validator'], 'Validator'],
+        subclass_name: str,
         subtask: str,
         details: str
 ) -> str:
     """
     Validator exceptions are pretty formatted to have a main issue
 
-    :param subclass: The class or instance we encountered an issue on
+    :param subclass_name: The name of the subclass we encountered the issue on
     :param subtask: The subtask that we encountered an issue on, like checking probabilities
     :param details: The details on the issue
     :return: A formatted validator exception
     """
 
-    # Sometimes, we may get subclass as a instance,
-    # sometimes as a type. Standardize as a type
-    subclass = type(subclass) if not isinstance(subclass, type) else subclass
 
     # Merge the subtask, subclass, and details information together.
     # Get something that will look decent as the main body of the
     # error.
     header = f"An issue occurred while doing: '{subtask}'\n"
     body = textwrap.dedent(details)
-    tail = f"This occurred on validator of type: '{subclass}'"
+    tail = f"This occurred on validator of type: '{subclass_name}'"
     message = header + "\n" + body + "\n" + tail
 
     # Create the error, and return it
     return message
 
 
-def create_initialization_exception(subclass: Type['Validator'],
+def create_initialization_exception(subclass_name: str,
                                     subtask: str,
                                     details: str
                                     ) -> ValidatorException:
@@ -83,54 +80,17 @@ def create_initialization_exception(subclass: Type['Validator'],
     initialization of the class. Subtask, and details, meanwhile will end up
     merged into
 
-    :param subclass: The type of subclass that is having issues
+    :param subclass_name: The name of the validator that is having issues
     :param subtask: The initialization task we are troubled by
     :param details: The details of that initialization task
     :return: The exception
     """
     task = "trying to initialize the class"
-    message = format_exception_message(subclass, subtask, details)
-    return ValidatorException(subclass, task, message)
+    message = format_exception_message(subclass_name, subtask, details)
+    return ValidatorException(subclass_name, task, message)
 
 
-def create_subclass_code_exception(subclass: 'Validator',
-                                   code_feature: str,
-                                   details: str) -> ValidatorException:
-    """
-    A helper class, it tries
-    :param subclass: The validator subclass of concern
-    :param code_feature: Which code feature, such as 'predicate', is misbehaving
-    :param details: Any error message details
-    :return: The exception
-    """
-    task = "Validating the user provided operand"
-    subtask = f"Executing or using subclass provided code called '{code_feature}'"
-    message = format_exception_message(subclass, subtask, details)
-    return ValidatorException(subclass, task, message)
 
-
-def create_subclass_code_did_not_run_exception(subclass: 'Validator',
-                                               code_feature: str
-                                               ) -> ValidatorException:
-    details = f"""\
-    The provided code did not run successfully. It is possible that
-    your code was malformed, you did not provide needed kwargs, or even
-    that jit is acting up
-    """
-    return create_subclass_code_exception(subclass, code_feature, details)
-
-
-def create_subclass_code_returned_wrong_type_exception(subclass: 'Validator',
-                                                       code_feature: str,
-                                                       required: str,
-                                                       observed: Any,
-                                                       ) -> ValidatorException:
-    details = f"""\
-    The provided code ran just fine, however it did not return the 
-    correct type. The required type was '{required}', but what was
-    observed was '{type(observed)}
-    """
-    return create_subclass_code_exception(subclass, code_feature, details)
 
 
 ##
@@ -143,6 +103,526 @@ class ValidatorNodeSpec:
     args: Any
     kwargs: Any
 
+class AbstractValidator(ABC):
+    """
+    Define the abstract protocol that will be fufilled
+    by subclasses here
+    """
+    @abstractmethod
+    def chain_predicate(self, operand: Operand, **kwargs: Any)->bool:
+        """
+        A logical method that a subclass of validator must fufill in order
+        for its logic to operate properly
+
+        The chain predicate controls whether or not to continue validation if
+        the validation mechanism is passed.
+
+        :param operand: The operand, in case chain predicate depends on it
+        :param kwargs: The current kwargs. Can be used during condition
+        :return: A bool or scalar bool array
+        """
+        pass
+
+    @abstractmethod
+    def predicate(self, operand: Any, **kwargs) -> bool:
+        """
+        Abstract method a subclass must implement. This
+        should return true if validation is passed, and
+        false otherwise
+
+        :param operand: The operand that failed
+        :param kwargs: The kwargs situation for the operand
+        :return: A bool or scalar bool array
+        """
+        pass
+
+    @abstractmethod
+    def create_exception(self, operand: Any, **kwargs) -> Exception:
+        """
+        Abstract method that subclasses must implement to perform validation checks
+        on the given operand. This method should return an exception to be raised and otherwise handled. It
+        will only be triggered when the predicate fails.
+
+        It should NOT raise the exception itself.
+
+        :param operand: The operand to be validated.
+        :param kwargs: Additional keyword arguments that may be needed for validation.
+                       These arguments are accessible to all validators in the chain.
+        :return: A bool or scalar bool array, and an exception to raise if failing
+        """
+        pass
+
+    @abstractmethod
+    def handle_exception(self, exception: Exception, **kwargs) -> Exception:
+        """
+        Handles an exception detected from further down in the
+        validation chain. Does something with it. Must pass back
+        an exception, but the exception need not be the same one.
+
+        :param exception: The exception from downstream. You may log, throw,
+                          or otherwise cause side effects. It is recommended
+                          to log into kwargs if you do so
+        :return: Either an error, in which case the error chain continues, or None,
+                 which suppresses the error. You may even transform the original
+                 error, and return the new error.
+        """
+        return exception
+
+    @abstractmethod
+    def __init__(self, *args, **kwargs):
+        """
+        Initialize the validator, in whatever way
+        is needed.
+
+        All fields should be setup only here
+        """
+        pass
+
+#####
+# It is difficult to contain all mechanisms of core in a single class without it getting unwieldy
+#
+# We define the following node mechanism to allow us to wrap the user-provided functions
+####
+
+class SubclassFeaturesNode:
+    """
+    This class is a value validation-focused node that contains
+    the features of relevance extracted from a particular subclass.
+
+    For the most part, this just means the bound methods responsible
+    for performing validation. However, it also may include in the
+    future other methods, and at the moment includes the name of
+    the subclass so error messages will look pretty.
+
+    Regardless, anything that interacts with a subclass's code
+    or fields must go through this class.
+
+    Methods
+    =======
+
+    Ignoring internal methods, the following are provided
+
+    - predicate: Whether validation passed
+    - create_exception: A bound exception factory function
+    - handle_exception: Two things, first emit side effects and also emit new (or old) error
+    - chain_predicate: Whether to continue validation/.
+
+    Initialization
+    ==============
+
+    Initialization consists of providing the subclass name, and then
+    the subclass's version of the validation function listed above.
+
+    """
+    _exception_predicate_name: str = 'predicate'
+    _exception_factory_name: str = 'create_exception'
+    _exception_handle_name: str = 'handle_exception'
+    _exception_chain_name: str = 'chain_predicate'
+    _node_cache: Dict[Hashable, 'SubclassFeaturesNode'] = {}
+
+    #####
+    # Create error formatting functions. We will have many
+    # cases where we need to either tell the user you gave us code
+    # that does not run, or returned the wrong type.
+    #
+    # Following DRY, these are extracted into common methods
+    ####
+    def create_subclass_code_exception(self,
+                                       code_feature: str,
+                                       details: str) -> ValidatorException:
+        """
+        A helper class, it tries
+        :param subclass_name: The validator subclass of concern
+        :param code_feature: Which code feature, such as 'predicate', is misbehaving
+        :param details: Any error message details
+        :return: The exception
+        """
+        task = "Validating the user provided operand"
+        subtask = f"Executing or using subclass provided code called '{code_feature}'"
+        message = format_exception_message(self.subclass_name, subtask, details)
+        return ValidatorException(self.subclass_name, task, message)
+
+    def create_subclass_code_did_not_run_exception(self,
+                                                   code_feature: str
+                                                   ) -> ValidatorException:
+        details = f"""\
+        The provided code did not run successfully. It is possible that
+        your code was malformed, you did not provide needed kwargs, or even
+        that jit is acting up
+        """
+        return self.create_subclass_code_exception(code_feature, details)
+
+    def create_subclass_code_returned_wrong_type_exception(self,
+                                                           code_feature: str,
+                                                           required: str,
+                                                           observed: Any,
+                                                           ) -> ValidatorException:
+        details = f"""\
+        The provided code ran just fine, however it did not return the 
+        correct type. The required type was '{required}', but what was
+        observed was '{type(observed)}
+        """
+        return self.create_subclass_code_exception(code_feature, details)
+    #####
+    # Validation is required for every one of the important responsibilities
+    # subclasses
+    #
+    # These provide access points that are validated.
+    ####
+
+    def predicate(self, operand: Operand, **kwargs: Any)->bool:
+        """
+        Checks if the predicate is satisfied. Also, provides
+        feedback when the user-provided predicate is insane
+
+        :param operand: The operand to validate
+        :param kwargs: The kwargs conditioning the validation
+        :return: A bool or bool array
+        :raise ValidatorException: If the predicate specified did not run
+        :raise ValidatorException: If the predicate ran, but did not return a bool type.
+        """
+        try:
+            outcome = self._predicate(operand, **kwargs)
+        except Exception as err:
+            raise self.create_subclass_code_did_not_run_exception(self._exception_predicate_name) from err
+        if not isinstance(outcome, bool):
+            raise self.create_subclass_code_returned_wrong_type_exception(self._exception_predicate_name,
+                                                                          required='bool',
+                                                                          observed=outcome)
+        return outcome
+
+    def create_exception(self, operand: Operand, **kwargs: Any)->Exception:
+        """
+        Create an exception which will be managed by the chain of
+        responsibility, and validate that the exception is sane
+
+        :param operand: The operand to validate
+        :param kwargs: The Kwargs conditioning the validation
+        :return: An exception for the situation
+        :raise ValidatorException: If the user-provided create exception mechanism did not run
+        :raise ValidatorException: If the the user provided mechanism ran, but did not return 
+                an exception
+        """
+        try:
+            outcome = self._create_exception(operand, **kwargs)
+        except Exception as err:
+            raise self.create_subclass_code_did_not_run_exception(self._exception_factory_name) from err
+        if not isinstance(outcome, Exception):
+            raise self.create_subclass_code_returned_wrong_type_exception(self._exception_factory_name,
+                                                                          required='Exception',
+                                                                          observed=outcome)
+        return outcome
+
+
+    def handle_exception(self, exception: Exception, **kwargs: Any)->Exception:
+        """
+        Handles some action that an exception can cause or encourage
+
+        :param exception: The exception to handle
+        :param kwargs: The kwargs influencing this exception
+        :return: An exception, either the same one or a different one
+        :raise ValidatorException: If the user-provided handle exception mechanism could not be run
+        :raise ValidatorException: If the the user provided mechanism ran, but did not return
+                an exception
+        """
+        try:
+            outcome = self._handle_exception(exception, **kwargs)
+        except Exception as err:
+            raise self.create_subclass_code_did_not_run_exception(self._exception_handle_name) from err
+        if not isinstance(outcome, Exception):
+            raise self.create_subclass_code_returned_wrong_type_exception(self._exception_handle_name,
+                                                                          required="Exception",
+                                                                          observed = outcome)
+        return outcome
+
+    def chain_predicate(self, operand: Exception, **kwargs: Any)->bool:
+        """
+        Checks into whether the chain predicate says to continue further in the
+        chain of responsibility
+
+        :param operand: The operand being validated
+        :param kwargs: The kwargs conditioning the validation
+        :return: A bool or bool array
+        :raise ValidatorException: If the user-provided chain predicate mechanism did not run
+        :raise ValidatorException: If the the user provided mechanism ran, but did not return
+                a bool
+        """
+        try:
+            outcome = self._chain_predicate(operand, **kwargs)
+        except Exception as err:
+            raise self.create_subclass_code_did_not_run_exception(self._exception_chain_name) from err
+        if not isinstance(outcome, bool):
+            raise self.create_subclass_code_returned_wrong_type_exception(self._exception_chain_name,
+                                                                          required='bool',
+                                                                          observed=outcome)
+        return outcome
+
+    def __init__(self, subclass: AbstractValidator):
+
+        self.subclass_name = type(subclass).__name__
+        self._predicate = subclass.predicate
+        self._create_exception = subclass.create_exception
+        self._handle_exception = subclass.handle_exception
+        self._chain_predicate = subclass.chain_predicate
+
+HandleCallback = Callable[[Exception, ...], Exception]
+SuccessCallback = Callable[[Operand, ...], None]
+class ValidationLogicNode:
+    """
+    Background
+    ==========
+
+    Internally and conceptually, validation is implemented
+    as a chain-of-responsibility. This means there is a
+    linked list, and each element of the linked list
+    has a particular responsibility
+
+    Purpose
+    =======
+
+    This class is that linked list.
+
+    It is dedicated to providing logic for the validator-specific
+    mechanisms, and for calling into the next node if it exists. It
+    must also call into the success or failure callbacks, if provided.
+
+    Logic - Recurrent vs actual
+    ===========================
+
+    Jax is a little tricky to run flow control against if you
+    want to maintain jit compatibility.
+
+    To ensure compatibility is maintained, we use flow control with
+    a switch based architecture, and have switch cases validation completely
+    passed, validation failed
+
+    Additionally, exception generation and handling is executed under python
+    by means of a debug callback.
+    """
+    ####
+    # It is exceptionally difficult to logically organize
+    # complex flow control using jax.
+    #
+    # We use a switch statement for the flow control cases
+    # in this class. The following bits of code will
+    # make the switch cases
+    ####
+    def did_validation_pass(self, operand: Operand, kwargs: Dict[str, Any])->bool:
+        return self.subclass_functions.predicate(operand, **kwargs)
+    def can_continue_chain(self, operand: Operand, kwargs: Dict[str,Any])->bool:
+        if self.next is None:
+            return False
+        return self.subclass_functions.chain_predicate(operand, **kwargs)
+    def make_switch_case(self, operand: Operand, kwargs: Dict[str, Any])->int:
+        """
+        Creates one of three switch cases in index format, since
+        jax likes indices rather than branches. We define three cases -
+
+        0: Failure case. An error was reached
+        1: Success case. Validation is done
+        2: Chain can be continued like normal
+        """
+        case = 0
+        case = case + self.did_validation_pass(operand, kwargs) # Is one if passed, zero otherwise
+        case = case + case*self.can_continue_chain(operand, kwargs) # In case prior passed,
+        return case
+
+    ####
+    # Because jax is functional, making the logic work requires
+    # a few factory methods and an exception branch must be
+    # defined here
+    ####
+
+    def wrap_handle_callback(self, handle_callback: HandleCallback)->HandleCallback:
+        """
+        Wraps a handle callback to instead first call into
+        this node's handle method, then call into the last
+        node.
+
+        :param handle_callback: The current handle callback
+        :return: The new wrapped version
+        """
+        def wrapped_handle_callback(exception: Exception, **kwargs):
+            # First runs the handle method on this node, then
+            # calls into the handle callback from the last node
+            exception = self.subclass_functions.handle_exception(exception, **kwargs)
+            handle_callback(exception, **kwargs)
+        return wrapped_handle_callback
+
+    def run_exception_branch(self,
+                             operand: Operand,
+                             handle_callback: HandleCallback,
+                             success_callback: SuccessCallback,
+                             kwargs: Dict[str, Any]
+                             ):
+        """
+        This is part interface, part logic, and is executed if an exception
+        state is reached. It will create the exception, then call into the
+        handling callback
+        """
+        exception = self.subclass_functions.create_exception(operand, **kwargs)
+        handle_callback(exception, **kwargs)
+
+    ###
+    # Primary validation logic
+    ###
+    def run_validation(self,
+                       operand: Operand,
+                       handle_callback: HandleCallback,
+                       success_callback: SuccessCallback,
+                       kwargs: Dict[str, Any]) -> object:
+        ##
+        # Validation is performed with what is effectively a recurrent
+        # architecture, that calls into subsequent code. For reasons
+        # of jax compatibility, a switch statement is used for flow control.
+        # There are two base cases, then a recurrent case:
+        #
+        # switch_index: 0: Base case, exception detected
+        # switch_index: 1: Base case, all validation passed
+        # switch_index: 2: Recurrent case, calls into next node.
+        #
+        ###
+
+        handle_callback = self.wrap_handle_callback(handle_callback)
+        switch_index = self.make_switch_case(operand, kwargs)
+        switch_cases = [jax.tree_util.Partial(jax.debug.callback, self.run_exception_branch),
+                        success_callback,
+                        self.next.run_validation]
+        jax.lax.switch(switch_index,
+                       switch_cases,
+                       operand,
+                       handle_callback,
+                       success_callback,
+                       kwargs
+                       )
+    def __init__(self,
+                 value: SubclassFeaturesNode,
+                 next: Optional['ValidationLogicNode'] = None
+                 ):
+        """
+        This should rarely ever be called directly
+        :param value:
+        :param next:
+        """
+        self.subclass_functions = value
+        self.next = next
+    def __call__(self,
+                 operand: Operand,
+                 final_exception_callback: Optional[HandleCallback],
+                 final_success_callback: Optional[HandleCallback],
+                 kwargs: Dict[str, Any],
+                 ):
+        """
+        Executes the validation contained within the chain.
+
+        :param operand: The operand to be validated
+        :param final_exception_callback: The final callback to be called into when traversing the exception branch
+        :param final_success_callback: The final callback to be called into when successful at validating
+        :param kwargs: The kwargs, in dictionary form, that were captured when the user called
+        """
+        self.run_validation(operand, final_exception_callback, final_success_callback, kwargs)
+
+class ValdationExecuter:
+    """
+    This contains the validator linked list
+    and callbacks. It is the actual interface
+    used to call into the validation logic.
+    """
+    cache = get_cache("LogicNodesCache")
+    @classmethod
+    def build_list(cls, nodes: List[SubclassFeaturesNode]):
+        """
+        Builds the validator nodes, using the cache
+        to shortcut the process wherever possible.
+
+        :param nodes: The nodes list to build
+        :return: The validator linked list logic.
+        """
+
+        if len(nodes) == 1:
+            # If the passed node has been observed before, the cache
+            # should just fetch it.
+            #
+            # this is the base case
+            return cls.cache.fetch(ValidationLogicNode, nodes[0], None)
+
+        # Fetch the subnode, and then build the current node.
+        subnode = cls.cache.fetch(cls.build_list, nodes[1:])
+        return cls.cache.fetch(ValidationLogicNode, subnode)
+
+    def __init__(self,
+                nodes: List['Validator'],
+                ):
+        """
+        Initialization should consist of the nodes list,
+        which is a list of SubclassFeaturesNodes, and
+        the existing
+        :param nodes: The list of nodes to execute during validation
+        :param final_exception_callback: The final callback to execute when failing
+        :param final_success_callback: The final callback to execute when success.
+        """
+
+        # Get context elements from global state.
+        final_exception_callback = get_exception_callback()
+        final_success_callback = get_success_callback()
+
+        # Create default callbacks if required
+        if final_exception_callback is None:
+            final_exception_callback = lambda exception, **kwargs : None
+        if final_success_callback is None:
+            final_success_callback = lambda operand, **kwargs : None
+
+        # Convert validators into subclass nodes
+
+        nodes = [SubclassFeaturesNode(item) for item in nodes]
+
+        # Store
+        self.validator_function = self.build_list(nodes)
+        self.final_exception_callback = final_exception_callback
+        self.final_success_callback = final_success_callback
+    def __call__(self,
+                 operand: Operand,
+                 **kwargs
+                 ):
+        """
+        Executes validation.
+
+        :param operand: The operand to validate
+        :param kwargs: The kwargs conditioning the validation.
+        """
+        self.validator_function(operand,
+                        self.final_exception_callback,
+                        self.final_success_callback,
+                        kwargs)
+
+class Validator(AbstractValidator):
+    def __append(self, links: List['Validator'])->'Validator':
+        """
+        Inserts another validator at the start of the validation chain
+        """
+        links = self._links + links
+        instance = self.clone()
+        instance.rebuild(links)
+        return instance
+
+    def rebuild(self, links: List['Validator']):
+        self._links = links
+        self._validate = ValdationExecuter(links)
+
+    def clone(self)->'Validator':
+        return type(self)(*self.__args, **self.__kwargs)
+    def __new__(cls,
+                __next_node__,
+                *args,
+                **kwargs):
+
+
+
+        instance = super().__new__(cls)
+        instance.__args = args
+        instance.__kwargs = kwargs
+    def __init__(self):
+        self.rebuild([self])
 
 # Begin main definition
 class Validator(ABC):
@@ -688,17 +1168,7 @@ class Validator(ABC):
     #
     ########################
 
-    def chain_predicate(self, **kwargs) -> bool:
-        """
-        A function that exists primarily to make suppressing
-        errors easy and efficient. This function is called before checking the next
-        node. By default it returns true - however, if it was to return
-        false, the next node in the chain would not be checked
 
-        :param kwargs: Any mutable context kwargs
-        :return: A bool. True to continue the chain, false to break
-        """
-        return True
 
     def _execute_chain_predicate(self, **kwargs) -> bool:
         # A helper function that sanity checks
