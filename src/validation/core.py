@@ -1,8 +1,10 @@
 import textwrap
+import cachetools
+import cachetools.keys
 
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
-from typing import Any, Optional, List, Dict, Tuple, Callable, Type, Hashable
+from typing import Any, Optional, List, Dict, Tuple, Callable, Type, Hashable, Generator, Union
 
 from .state import get_success_callback, get_exception_callback, get_cache
 from .types import Operand
@@ -89,7 +91,139 @@ def create_initialization_exception(subclass_name: str,
     message = format_exception_message(subclass_name, subtask, details)
     return ValidatorException(subclass_name, task, message)
 
+class LinkListNode:
+    """
+    A statically defined linked list node mechanism,
+    this is designed to implement the linked list
+    part of the equation.
 
+    """
+
+    ##
+    # Define the central features of each node
+    #
+    # There exists a next_node feature and a
+    # rebind factory. This is particular to the node
+    #
+    # There also exists a attr class and
+    # instance cache that will be common across all LinkListNode
+    # instances
+    ###
+    next_node: 'LinkListNode'
+    NodeBindingFactory: 'NodeBindingFactory'
+    attr_cache = get_cache("LinkAttrCache")
+    instance_cache = get_cache("LinkInstanceCache")
+
+    ##
+    # Define some relatively simple properties.
+    ##
+
+    @property
+    def has_next_node(self)->bool:
+        return self.next_node is not None
+
+    ###
+    # Setup various utility methods.
+    #
+    # This is very important as it ensures the caching mechanism
+    # can distinguish between different methods
+    ###
+    def method_key_factory(self, name: str):
+        """
+        Creates a method key factory, which has the
+        name of the method included in the hashing process
+
+        This should hopefully ensure we do not confuse different
+        methods with the same arguments
+        :param name: The name of the method
+        :return: A method key, bound to the method with that name
+        """
+
+        def method_key(self, *args, **kwargs):
+            args = [self, name, *args]
+            return cachetools.keys.hashkey(*args, **kwargs)
+
+        return method_key
+
+    def rebind_node(self, node: Optional['LinkListNode'])->'LinkListNode':
+        """
+        A very important method, this rebinds a provided node to point
+        at a different node instead
+
+        :param node: The node to point at
+        :return: A node with the same value, pointing to the new location
+        """
+        return self.__factory_key.bind_key(node)
+
+
+    ##
+    # Setup the attributes and features that need to be cached
+    # in the attr cache.
+    #
+    # These will not  return new instances
+    ##
+    @cachetools.cached(attr_cache, method_key_factory("length"))
+    def __len__(self) -> int:
+        if not self.has_next_node:
+            return 1
+        return len(self.next_node) + 1
+    @cachetools.cached(attr_cache, method_key_factory("key"))
+    def key(self)->Tuple['NodeBindingFactory', ...]:
+        if len(self) == 1:
+            return (self.__factory_key,)
+        return tuple([self.__factory_key, *self.next_node.key()])
+    @cachetools.cached(attr_cache, method_key_factory("hash"))
+    def __hash__(self) -> int:
+        return hash(self.key())
+
+    ##
+    # Other actions may result in the return of an instance or even
+    # a new instance. These are cached in the instance cache instead
+    ##
+    def __iter__(self)->Generator['LinkListNode']:
+        yield self
+        if self.has_next_node:
+            for item in iter(self):
+                yield item
+
+    @cachetools.cached(attr_cache, method_key_factory("as_list"))
+    def as_keylist(self)->List['NodeBindingFactory']:
+        return list(self.key())
+
+    @cachetools.cached(instance_cache, method_key_factory("from_list"))
+    @classmethod
+    def from_keylist(cls, items: List['NodeBindingFactory'])-> 'LinkListNode':
+        if len(items) == 1:
+            subnode = None
+        else:
+            subnode = cls.from_keylist(items[1:])
+        return items[0].bind_key(subnode)
+
+    # TODO: The following is not terribly elegant
+    #
+    # It gets the job done, but might need replacing if cache rebuilds happen often.
+
+    @cachetools.cached(instance_cache, method_key_factory("getitem"))
+    def __getitem__(self, item: Union[int, slice])->'LinkListNode':
+        return list(self.__iter__())[item]
+    @cachetools.cached(instance_cache, method_key_factory("append"))
+    def append(self, item: 'LinkListNode')->'LinkListNode':
+        items = self.as_keylist()
+        items.append(item)
+        return self.from_keylist(items)
+    @cachetools.cached(instance_cache, method_key_factory("insert"))
+    def insert(self, index: int, value: 'LinkListNode')->'LinkListNode':
+        items = self.as_keylist()
+        inserting = value.as_keylist()
+        items = items[:index] + inserting + items[index:]
+        return self.from_keylist(items)
+
+    def __init__(self,
+                 next_node: 'LinkListNode',
+                 node_key_factory: 'NodeBindingFactory',
+                 ):
+        self.next_node = next_node
+        self.__factory_key = node_key_factory
 
 
 
@@ -168,15 +302,7 @@ class AbstractValidator(ABC):
         """
         return exception
 
-    @abstractmethod
-    def __init__(self, *args, **kwargs):
-        """
-        Initialize the validator, in whatever way
-        is needed.
 
-        All fields should be setup only here
-        """
-        pass
 
 #####
 # It is difficult to contain all mechanisms of core in a single class without it getting unwieldy
@@ -184,7 +310,7 @@ class AbstractValidator(ABC):
 # We define the following node mechanism to allow us to wrap the user-provided functions
 ####
 
-class SubclassFeaturesNode:
+class SubclassMethodsInterface:
     """
     This class is a value validation-focused node that contains
     the features of relevance extracted from a particular subclass.
@@ -218,7 +344,7 @@ class SubclassFeaturesNode:
     _exception_factory_name: str = 'create_exception'
     _exception_handle_name: str = 'handle_exception'
     _exception_chain_name: str = 'chain_predicate'
-    _node_cache: Dict[Hashable, 'SubclassFeaturesNode'] = {}
+    _node_cache: Dict[Hashable, 'SubclassMethodsInterface'] = {}
 
     #####
     # Create error formatting functions. We will have many
@@ -365,17 +491,80 @@ class SubclassFeaturesNode:
         self._handle_exception = subclass.handle_exception
         self._chain_predicate = subclass.chain_predicate
 
+@dataclass(frozen=True)
+class NodeBindingFactory:
+    """
+    A validator node may be subclassed, and the subclass must
+    be reproducable multiple times in factory-like fashion
+    but possibly pointing towards a different node.
+
+    """
+    ##
+    # Define the fields that the constructor key can store
+    # These will be some extra info for pretty printing, and
+    # the features needed to rebuild the node, sans what the
+    # next link would be
+    ##
+
+    name: str
+    cls_type: Type['ListNode']
+    params_flat: Tuple[Hashable, ...]
+    params_treedef: PyTreeDef
+    def __hash__(self)->int:
+        key = (self.cls_type, self.params_flat, self.params_treedef)
+        return hash(key)
+
+    ###
+    # Define the methods usable for making a key,
+    # or binding the key back into a node
+    ##
+    @classmethod
+    def make_key(cls, node: 'ListNode', *args, **kwargs)-> 'ConstructorNodeKey':
+        """
+        Creates a constructor key capable of rebuilding the current
+        node if needed, and capable of representing the current
+        node in hashable situations.
+
+        :param instance: The instance to represent
+        :param args: The args used to create the instance
+        :param kwargs: The kwargs used to create the instance
+        :return: A constructor key, related to the situation
+        """
+        cls_type = node.__class__
+        name = cls.__name__
+        constructor_params = (args, kwargs)
+        flat_constructor_params, constructor_treedef = jax.tree_util.tree_flatten(constructor_params)
+        return cls(name=name,
+                   cls_type=cls_type,
+                   params_flat = tuple(flat_constructor_params),
+                   params_treedef=constructor_treedef)
+    def bind_key(self, node: Optional['ListNode'])->'ListNode':
+        """
+        Takes an existing constructor key and binds it to a particular node,
+        returning an instance.
+
+        :param node: The next node to consider. Can be a listnode or none
+        :return: The new listnode, with same arguments and bound to Node
+        """
+        args, kwargs = jax.tree_util.tree_unflatten(self.params_treedef, self.params_flat)
+        instance = self.cls_type(node, *args, **kwargs)
+        return instance
+
+
 HandleCallback = Callable[[Exception, ...], Exception]
 SuccessCallback = Callable[[Operand, ...], None]
-class ValidationLogicNode:
+class LogicNode:
     """
     Background
     ==========
 
     Internally and conceptually, validation is implemented
-    as a chain-of-responsibility. This means there is a
-    linked list, and each element of the linked list
-    has a particular responsibility
+    using the chain-of-responsibility pattern. This means there is a
+    linked list, and each element of the linked list has a particular
+    responsibility
+
+    This implements the linking mechanism, and also implements the
+    logic to bind the list of links into a
 
     Purpose
     =======
@@ -399,6 +588,9 @@ class ValidationLogicNode:
     Additionally, exception generation and handling is executed under python
     by means of a debug callback.
     """
+
+
+
     ####
     # It is exceptionally difficult to logically organize
     # complex flow control using jax.
@@ -410,7 +602,7 @@ class ValidationLogicNode:
     def did_validation_pass(self, operand: Operand, kwargs: Dict[str, Any])->bool:
         return self.subclass_functions.predicate(operand, **kwargs)
     def can_continue_chain(self, operand: Operand, kwargs: Dict[str,Any])->bool:
-        if self.next is None:
+        if self.next_node is None:
             return False
         return self.subclass_functions.chain_predicate(operand, **kwargs)
     def make_switch_case(self, operand: Operand, kwargs: Dict[str, Any])->int:
@@ -487,7 +679,7 @@ class ValidationLogicNode:
         switch_index = self.make_switch_case(operand, kwargs)
         switch_cases = [jax.tree_util.Partial(jax.debug.callback, self.run_exception_branch),
                         success_callback,
-                        self.next.run_validation]
+                        self.next_node.run_validation]
         jax.lax.switch(switch_index,
                        switch_cases,
                        operand,
@@ -495,17 +687,18 @@ class ValidationLogicNode:
                        success_callback,
                        kwargs
                        )
+
     def __init__(self,
-                 value: SubclassFeaturesNode,
-                 next: Optional['ValidationLogicNode'] = None
+                 subclass_bindings: SubclassMethodsInterface,
+                 next_node: Optional['LogicNode'] = None
                  ):
         """
         This should rarely ever be called directly
-        :param value:
-        :param next:
+        :param subclass_bindings: The subclass methods interface containing the subclass methods
+        :param next_node: The next logic node in the linked list.
         """
-        self.subclass_functions = value
-        self.next = next
+        self.subclass_functions = subclass_bindings
+        self.next_node = next_node
     def __call__(self,
                  operand: Operand,
                  final_exception_callback: Optional[HandleCallback],
@@ -522,6 +715,197 @@ class ValidationLogicNode:
         """
         self.run_validation(operand, final_exception_callback, final_success_callback, kwargs)
 
+
+class ListNode(AbstractValidator, LogicNode):
+    """
+
+    """
+
+    attributes_cache = get_cache("ListNodeAttr")
+    instance_cache = get_cache("ListNodeInstance")
+    next_node: 'ListNode'
+
+
+
+
+    ###
+    # Define some important cache manipulation mechanism
+    #
+    # Primarily, we define the method key factory. This will insert
+    # data on the name of a method into the cache hashing mechanism, ensuring
+    # different methods called with the same arguments cannot be confused
+    #
+    # We also define here
+    ##
+
+    def __method_key_factory(self, name: str):
+        """
+        Creates a method key factory, which has the
+        name of the method included in the hashing process
+
+        This should hopefully ensure we do not confuse different
+        methods with the same arguments
+        :param name: The name of the method
+        :return: A method key, bound to the method with that name
+        """
+
+        def method_key(self, *args, **kwargs):
+            args = [self, name, *args]
+            return cachetools.keys.hashkey(*args, **kwargs)
+
+        return method_key
+
+    ##
+    # Define a few magic methods used to manipulate lists
+    #
+    # Since these traverse the list, they are cached in the attributes
+    # cache mechanism.
+    ##
+    @cachetools.cached(attributes_cache, __method_key_factory("hash"))
+    def __hash__(self) -> int:
+        if not self.has_next_node:
+            return 1
+        return self.next_node.__detect_length() + 1
+    @cachetools.cached(attributes_cache, __method_key_factory("length"))
+    def __len__(self) -> int:
+        if not self.has_next_node:
+            return 1
+        return self.next_node.__detect_length() + 1
+    @cachetools.cached(attributes_cache, __method_key_factory("iter"))
+    def __iter__(self):
+        yield self
+        if self.has_next_node:
+            for item in self.next_node:
+                yield item
+
+
+
+
+    ###
+    # Define internal linked list walking methods
+    # used to compute various quantities and perform
+    # various tasks.
+    #
+    # We also define the pytree conversions here as well
+    ###
+    @cachetools.cached()
+    def chain_key(self)->Tuple[ConstructorNodeKey, ...]:
+        """
+        Creates a hashable key that completely represents the chain of events that
+        lead to this node being in place. That will include the constructor key used
+        by myself, and by child nodes.
+        :return:
+        """
+        node_key = ConstructorNodeKey.make_key(self, self.__args, self.__kwargs)
+        if not self.has_next_node:
+            return (node_key,)
+        return tuple([node_key, *self.next_node.chain_key()])
+
+
+    @staticmethod
+    def from_chain_key(chain_key: Tuple[ConstructorNodeKey, ...])->'ListNode':
+        chain = list(chain_key)
+        node = None
+        while chain:
+            key = chain.pop()
+            node = key.bind_key(node)
+        return node
+
+    def tree_flatten_with_keys(self):
+        raise NotImplementedError()
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        raise NotImplementedError()
+
+    ##
+    # Define the node manipulation methods
+    #
+    # These tend to be very expensive, as they may
+    # involve rebuilding the entire linked list,
+    # and so are cached.
+    ##
+    @cachetools.cached(instance_cache, __method_key_factory("rebind_node"))
+    def rebind_node(self, node: 'ListNode')-> 'ListNode':
+        """
+        Reproduces the values of the current node, but
+        with the link pointing to a different next node
+
+        :param node: The Node to point to
+        :return: A new node pointing to that link instead
+        """
+        # Essentially, this is a factory mechanism that reproduces the
+        # args and kwargs passed in, but with a different node
+        return self.__class__(node,
+                              *self.__args,
+                              **self.__kwargs)
+    @staticmethod
+    def _append(self: 'ListNode', other: 'ListNode'):
+        self_list = self.
+
+    @cachetools.cached(instance_cache, __method_key_factory("append"))
+    def append(self, node: 'ListNode')->'ListNode':
+        """
+        Appends a validation sequence onto another
+        validation sequence
+
+        :param node: The node to append
+        :return: The revised sequence
+        """
+        self_list = self.chain_key
+        if self.chain_representation is None:
+        if not node.has_next_node:
+            # Base case reached, rebind
+            return self.rebind_node(node)
+        # Append to subnode, then rebind.
+        subnode = self.next_node.append(node)
+        return self.rebind_node(subnode)
+
+    @cachetools.cached(instance_cache, __method_key_factory("insert"))
+    def insert(self, index: int, node: 'ListNode')->'ListNode':
+        """
+        Inserts one list into another without breaking
+        the links.
+
+        Returns a new instance
+        :param index: The index to set to
+        :param node: The node to insert there
+        :return: The new list node
+        """
+        if index == 0:
+            # Base case, append myself onto inserted chain
+            return node.append(self)
+        # Recurrent descent case. Travel to link, insert
+        # there, rebuild with new case
+        subnode = self.next_node.insert(index - 1, node)
+        return self.rebind_node(subnode)
+
+    def __init__(self,
+                 next_node: 'ListNode',
+                 *args,
+                 **kwargs
+                 ):
+
+        # Define and initialize the logic of the LogicNode
+        #
+        # Also sets up the linked list for the first time
+        subclass_bindings = SubclassMethodsInterface(self)
+        constructor_node = ConstructorNodeKey(self.__class_)
+        super().__init__(subclass_bindings, next_node)
+
+        # Store away arguments and keyword arguments
+        # These can be used in factory methods to create
+        # new instances pointing to different nodes
+        self.__args = args
+        self.__kwargs = kwargs
+
+        # Store away something else
+
+    # Define properties and related phenomenon properties
+    @property
+    def has_next_node(self) -> bool:
+        return self.next_node is not None
+
 class ValdationExecuter:
     """
     This contains the validator linked list
@@ -530,7 +914,7 @@ class ValdationExecuter:
     """
     cache = get_cache("LogicNodesCache")
     @classmethod
-    def build_list(cls, nodes: List[SubclassFeaturesNode]):
+    def build_list(cls, nodes: List[SubclassMethodsInterface]):
         """
         Builds the validator nodes, using the cache
         to shortcut the process wherever possible.
@@ -544,11 +928,11 @@ class ValdationExecuter:
             # should just fetch it.
             #
             # this is the base case
-            return cls.cache.fetch(ValidationLogicNode, nodes[0], None)
+            return cls.cache.fetch(LogicNode, nodes[0], None)
 
         # Fetch the subnode, and then build the current node.
         subnode = cls.cache.fetch(cls.build_list, nodes[1:])
-        return cls.cache.fetch(ValidationLogicNode, subnode)
+        return cls.cache.fetch(LogicNode, subnode)
 
     def __init__(self,
                 nodes: List['Validator'],
@@ -574,7 +958,7 @@ class ValdationExecuter:
 
         # Convert validators into subclass nodes
 
-        nodes = [SubclassFeaturesNode(item) for item in nodes]
+        nodes = [SubclassMethodsInterface(item) for item in nodes]
 
         # Store
         self.validator_function = self.build_list(nodes)
@@ -596,33 +980,67 @@ class ValdationExecuter:
                         kwargs)
 
 class Validator(AbstractValidator):
-    def __append(self, links: List['Validator'])->'Validator':
-        """
-        Inserts another validator at the start of the validation chain
-        """
-        links = self._links + links
-        instance = self.clone()
-        instance.rebuild(links)
+
+    ###
+    # Two important methods are lazily initialized
+    # if needed
+    ###
+    cache = get_cache("Validator")
+    @property
+    def validate(self):
+        if self._validate is None:
+            self.__post_init_hook__()
+        return self._validate
+
+    @property
+    def links(self)->List['Validator']:
+        if self._links is None:
+            self.__post_init_hook__()
+        return self._links
+
+    def __post_init_hook__(self, nodes: Optional['Validator'] = None):
+        if nodes is None:
+            nodes = [self]
+        self._links = nodes
+        self._validate = ValdationExecuter(nodes)
+
+    def rebind_links(self,
+               nodes: List['Validator']
+               )->'Validator':
+        instance = self.cache.fetch(self.constructor, *self.__args, **self.__kwargs)
+        instance.__post_init_hook__(nodes)
         return instance
 
-    def rebuild(self, links: List['Validator']):
-        self._links = links
-        self._validate = ValdationExecuter(links)
-
-    def clone(self)->'Validator':
-        return type(self)(*self.__args, **self.__kwargs)
-    def __new__(cls,
-                __next_node__,
-                *args,
-                **kwargs):
-
-
-
-        instance = super().__new__(cls)
+    def append(self, validator: 'Validator')->'Validator':
+        links = self.links + validator.links
+        instance = self.rebind(links)
+        return instance
+    @classmethod
+    def constructor(cls, *args, **kwargs):
+        instance = cls(*args, **kwargs)
         instance.__args = args
         instance.__kwargs = kwargs
+        return instance
+    def __new__(cls, *args, **kwargs):
+        instance = super().__new__(cls)
+
+        instance = cls.cache.fetch(cls.constructor, *args, **kwargs)
+
+        instance.__args = args
+        return instance
+
+    def __init__(self, next_validator: Optional['Validator']):
     def __init__(self):
-        self.rebuild([self])
+        self.__link_setup_run: bool = False
+        self._links: List['Validator'] = [self]
+        self._validate: Optional[ValdationExecuter] = None
+
+    def append(self, validator: 'Validator')->'Validator':
+        links = self._links
+        links = links + validator.links
+        instance = type(self)(*self.__args, **self.__kwargs)
+
+
 
 # Begin main definition
 class Validator(ABC):

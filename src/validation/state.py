@@ -8,8 +8,10 @@ This may include things like context, or caches.
 """
 
 
-
 from typing import Tuple, Type, Any, Optional, Callable, Dict
+
+import cachetools
+
 from .types import Operand
 
 import jax.lax
@@ -21,6 +23,9 @@ from jax._src.tree_util import PyTreeDef
 #
 ##
 class StateData:
+    def get_cache(self, name: str):
+        if name not in self.
+
     def __init__(self):
         self.caches: Dict[str, 'Cache'] = {}
         self.final_callback: Optional[Callable[[Exception, ...], None]] = None
@@ -31,56 +36,7 @@ state = StateData()
 # Define caching structure
 # and manipulation methods
 ###
-
-class Cache:
-    """
-    Caching can be used to speed up computational
-    construction and usage processes in several locations
-
-    This is a class to let that happen.
-    """
-    def __init__(self):
-        self.cache = {}
-
-    def setup_key_in_cache(self, key: Tuple[Type[Any], Tuple[...], PyTreeDef]):
-        """
-        Uses the provided key to setup the appropriate cache entry
-        """
-        cls, flat_params, treedef = key
-        args, kwargs = jax.tree_util.tree_unflatten(treedef, flat_params)
-        instance = cls(*args, **kwargs)
-        self.cache[key] = instance
-
-    def no_op(self, key: Tuple[Type[Any], Tuple[...], PyTreeDef]):
-        """ Does nothing. Exists for cond call"""
-        pass
-
-    @staticmethod
-    def create_unique_id(cls: Type[Any],
-                         *args: Any,
-                         **kwargs: Any):
-        """
-
-        :param cls: The class being identified
-        :param args: The args that will be fed to any constructor
-        :param kwargs: The kwargs that will be fed to any constructor
-        :return: A hashable key representing the class
-        """
-        # Creating a unique key can be done by flattening the tree structure using
-        # tree flatten to get a unique treedef, then
-        constructor_parameters = (args, kwargs)
-        flat_constructor_parameters, constructor_treedef = jax.tree_util.tree_flatten(constructor_parameters)
-        flat_constructor_parameters = tuple(flat_constructor_parameters)
-        hashable_representation = (cls, flat_constructor_parameters, constructor_treedef)
-        return hashable_representation
-    def fetch(self, constructor, *args, **kwargs)->Any:
-        cache_id = self.create_unique_id(constructor, *args, **kwargs)
-        jax.lax.cond(cache_id in self.cache,
-                     self.no_op,
-                     self.setup_key_in_cache,
-                     cache_id,
-                     )
-        return self.cache[cache_id]
+cache_size = 2000
 
 
 def get_cache(name: str):
@@ -94,7 +50,7 @@ def get_cache(name: str):
     :return: The cache entity.
     """
     if name not in state.caches:
-        state.caches[name] = Cache()
+        state.caches[name] = cachetools.LFUCache(cache_size)
     return state.caches[name]
 
 ###
